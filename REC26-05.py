@@ -17,6 +17,7 @@ import pickle
 import re
 import sys
 import textwrap
+import time
 from dataclasses import dataclass, asdict
 from pathlib import Path
 from typing import Iterable
@@ -305,16 +306,20 @@ Context:
 {context}
 """.strip()
 
-    try:
-        client = get_gemini_client()
-        response = client.models.generate_content(
-            model=model,
-            contents=prompt,
-            config=types.GenerateContentConfig(temperature=0),
-        )
-        return (getattr(response, "text", None) or "").strip()
-    except Exception as exc:
-        return f"Gemini generation failed, using extractive fallback. Error: {exc}"
+    client = get_gemini_client()
+    for attempt in range(3):
+        try:
+            response = client.models.generate_content(
+                model=model,
+                contents=prompt,
+                config=types.GenerateContentConfig(temperature=0),
+            )
+            return (getattr(response, "text", None) or "").strip()
+        except Exception as exc:
+            if attempt == 2:
+                print(f"Gemini generation unavailable; using extractive fallback. {exc}", file=sys.stderr)
+                return None
+            time.sleep(2 + attempt * 3)
 
 
 def answer_question(question: str, index_dir: Path, top_k: int, model: str | None) -> dict:

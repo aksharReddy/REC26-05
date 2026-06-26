@@ -3,4 +3,5 @@ __pycache__/
 *.pyc
 rag_index/
 rag_index_tfidf_test/
+rag_index_chunk_check/
 evaluation_results.json
