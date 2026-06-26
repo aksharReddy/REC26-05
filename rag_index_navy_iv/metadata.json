@@ -1,0 +1,12 @@
+{
+  "chunk_words": 350,
+  "chunk_overlap": 70,
+  "chunk_count": 141,
+  "embedding_provider": "gemini",
+  "embedding_model": "gemini-embedding-001",
+  "embedding_options": {
+    "batch_size": 16,
+    "delay_seconds": 3.0,
+    "contents_per_minute": 80
+  }
+}

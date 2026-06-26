@@ -37,6 +37,9 @@ MIN_CONFIDENCE = 0.08
 DEFAULT_EMBEDDING_PROVIDER = "gemini"
 DEFAULT_GEMINI_EMBEDDING_MODEL = "gemini-embedding-001"
 DEFAULT_GEMINI_MODEL = "gemini-2.5-flash"
+DEFAULT_GEMINI_EMBEDDING_BATCH_SIZE = 16
+DEFAULT_GEMINI_EMBEDDING_DELAY_SECONDS = 3.0
+DEFAULT_GEMINI_EMBEDDING_CONTENTS_PER_MINUTE = 80
 
 
 @dataclass
@@ -138,21 +141,63 @@ def format_gemini_embedding_input(text: str, model: str, task_type: str) -> str:
     return f"title: none | text: {text}"
 
 
-def gemini_embed_texts(texts: list[str], model: str, task_type: str) -> np.ndarray:
+def gemini_embed_texts(
+    texts: list[str],
+    model: str,
+    task_type: str,
+    batch_size: int = DEFAULT_GEMINI_EMBEDDING_BATCH_SIZE,
+    delay_seconds: float = DEFAULT_GEMINI_EMBEDDING_DELAY_SECONDS,
+    contents_per_minute: int = DEFAULT_GEMINI_EMBEDDING_CONTENTS_PER_MINUTE,
+) -> np.ndarray:
     from google.genai import types
 
     client = get_gemini_client()
     vectors: list[list[float]] = []
-    batch_size = 1 if model == "gemini-embedding-2" else 32
+    if batch_size < 1:
+        raise ValueError("Gemini embedding batch size must be at least 1.")
+    if contents_per_minute < 1:
+        raise ValueError("Gemini embedding contents-per-minute limit must be at least 1.")
+    if model == "gemini-embedding-2":
+        batch_size = 1
+    window_started = time.monotonic()
+    contents_in_window = 0
     for start in range(0, len(texts), batch_size):
         batch = [
             format_gemini_embedding_input(text, model, task_type)
             for text in texts[start : start + batch_size]
         ]
+        batch_number = start // batch_size + 1
+        total_batches = (len(texts) + batch_size - 1) // batch_size
+        if contents_in_window + len(batch) > contents_per_minute:
+            elapsed = time.monotonic() - window_started
+            if elapsed < 65:
+                wait_for = int(65 - elapsed)
+                print(f"Gemini embedding rate limit pause: waiting {wait_for}s...", file=sys.stderr)
+                time.sleep(wait_for)
+            window_started = time.monotonic()
+            contents_in_window = 0
+
         config = None
         if model != "gemini-embedding-2":
             config = types.EmbedContentConfig(task_type=task_type)
-        response = client.models.embed_content(model=model, contents=batch, config=config)
+        for attempt in range(3):
+            try:
+                print(
+                    f"Embedding batch {batch_number}/{total_batches} "
+                    f"({len(batch)} texts)...",
+                    file=sys.stderr,
+                )
+                response = client.models.embed_content(model=model, contents=batch, config=config)
+                break
+            except Exception as exc:
+                retry_after = parse_retry_delay_seconds(str(exc)) or (30 + attempt * 20)
+                if attempt == 2:
+                    raise
+                print(
+                    f"Gemini embedding rate-limited/unavailable; retrying in {retry_after}s...",
+                    file=sys.stderr,
+                )
+                time.sleep(retry_after)
         embeddings = getattr(response, "embeddings", None)
         if embeddings is None:
             embedding = getattr(response, "embedding", None)
@@ -164,7 +209,19 @@ def gemini_embed_texts(texts: list[str], model: str, task_type: str) -> np.ndarr
             if not values:
                 raise RuntimeError("Gemini returned an empty embedding.")
             vectors.append(list(values))
+        contents_in_window += len(batch)
+        if delay_seconds > 0 and start + batch_size < len(texts):
+            time.sleep(delay_seconds)
     return np.array(vectors, dtype=np.float32)
+
+
+def parse_retry_delay_seconds(message: str) -> int | None:
+    match = re.search(r"retryDelay'?:\s*'?(\d+(?:\.\d+)?)s", message)
+    if not match:
+        match = re.search(r"Please retry in (\d+(?:\.\d+)?)s", message)
+    if not match:
+        return None
+    return max(1, int(float(match.group(1))) + 2)
 
 
 def save_index(
@@ -174,6 +231,7 @@ def save_index(
     vectorizer: TfidfVectorizer | None,
     matrix,
     embedding_model: str | None,
+    embedding_options: dict | None = None,
 ) -> None:
     index_dir.mkdir(parents=True, exist_ok=True)
     with (index_dir / "chunks.jsonl").open("w", encoding="utf-8") as fh:
@@ -191,6 +249,8 @@ def save_index(
         "embedding_provider": provider,
         "embedding_model": embedding_model or "sklearn TfidfVectorizer word ngrams",
     }
+    if embedding_options:
+        metadata["embedding_options"] = embedding_options
     (index_dir / "metadata.json").write_text(json.dumps(metadata, indent=2), encoding="utf-8")
 
 
@@ -359,8 +419,16 @@ def cmd_ingest(args: argparse.Namespace) -> None:
             [chunk.text for chunk in chunks],
             args.embedding_model,
             "RETRIEVAL_DOCUMENT",
+            batch_size=args.embedding_batch_size,
+            delay_seconds=args.embedding_delay_seconds,
+            contents_per_minute=args.embedding_contents_per_minute,
         )
         embedding_model = args.embedding_model
+        embedding_options = {
+            "batch_size": args.embedding_batch_size,
+            "delay_seconds": args.embedding_delay_seconds,
+            "contents_per_minute": args.embedding_contents_per_minute,
+        }
     elif provider == "tfidf":
         vectorizer = TfidfVectorizer(
             lowercase=True,
@@ -372,10 +440,19 @@ def cmd_ingest(args: argparse.Namespace) -> None:
         )
         matrix = vectorizer.fit_transform([chunk.text for chunk in chunks])
         embedding_model = None
+        embedding_options = None
     else:
         raise ValueError("--embedding-provider must be gemini or tfidf")
 
-    save_index(Path(args.index_dir), chunks, provider, vectorizer, matrix, embedding_model)
+    save_index(
+        Path(args.index_dir),
+        chunks,
+        provider,
+        vectorizer,
+        matrix,
+        embedding_model,
+        embedding_options,
+    )
 
     print(f"Ingested {pdf_path} into {len(chunks)} chunks from {len(pages)} pages.")
     print(f"Embedding provider: {provider}")
@@ -459,6 +536,31 @@ def build_parser() -> argparse.ArgumentParser:
         "--embedding-model",
         default=os.getenv("GEMINI_EMBEDDING_MODEL", DEFAULT_GEMINI_EMBEDDING_MODEL),
         help="Gemini embedding model used when --embedding-provider gemini",
+    )
+    ingest.add_argument(
+        "--embedding-batch-size",
+        type=int,
+        default=int(os.getenv("GEMINI_EMBEDDING_BATCH_SIZE", DEFAULT_GEMINI_EMBEDDING_BATCH_SIZE)),
+        help="Gemini embedding texts per batch",
+    )
+    ingest.add_argument(
+        "--embedding-delay-seconds",
+        type=float,
+        default=float(
+            os.getenv("GEMINI_EMBEDDING_DELAY_SECONDS", DEFAULT_GEMINI_EMBEDDING_DELAY_SECONDS)
+        ),
+        help="seconds to sleep between Gemini embedding batches",
+    )
+    ingest.add_argument(
+        "--embedding-contents-per-minute",
+        type=int,
+        default=int(
+            os.getenv(
+                "GEMINI_EMBEDDING_CONTENTS_PER_MINUTE",
+                DEFAULT_GEMINI_EMBEDDING_CONTENTS_PER_MINUTE,
+            )
+        ),
+        help="max Gemini embedding texts to send per minute before pausing",
     )
     ingest.set_defaults(func=cmd_ingest)
 

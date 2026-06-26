@@ -25,6 +25,12 @@ Ingest and index the PDF:
 python REC26-05.py ingest --pdf RegsNavyI.pdf --embedding-provider gemini
 ```
 
+If Gemini rate-limits embeddings, use a slower ingest:
+
+```powershell
+python REC26-05.py ingest --pdf RegsNavyIV.pdf --embedding-provider gemini --index-dir rag_index_navy_iv --embedding-batch-size 16 --embedding-delay-seconds 3 --embedding-contents-per-minute 80
+```
+
 Ask a question:
 
 ```powershell
@@ -43,6 +49,7 @@ python REC26-05.py evaluate --questions questions.txt --output evaluation_result
 
 - **Chunking:** 350-word chunks with 70-word overlap. This keeps passages focused while staying under Gemini free-tier embedding limits for the supplied PDF.
 - **Embedding/index:** Gemini `gemini-embedding-001` by default. Local TF-IDF is kept as a no-key fallback.
+- **Gemini rate limiting:** embedding ingest batches texts, sleeps between batches, and pauses after a configurable per-minute content budget.
 - **Vector store:** persisted local files in `rag_index/`: `chunks.jsonl`, `gemini_embeddings.npy` or `tfidf.pkl`, and `metadata.json`.
 - **Retrieval:** cosine similarity over embedding vectors, default `top_k=5`.
 - **Prompting/generation:** Gemini is instructed to answer only from retrieved context and cite source ids/pages. Offline mode ranks retrieved sentences against the question and cites chunk ids/pages.
