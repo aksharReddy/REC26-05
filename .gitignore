@@ -1,0 +1,6 @@
+.env
+__pycache__/
+*.pyc
+rag_index/
+rag_index_tfidf_test/
+evaluation_results.json

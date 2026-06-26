@@ -1,0 +1,4 @@
+pypdf
+numpy
+scikit-learn
+google-genai
